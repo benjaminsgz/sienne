@@ -53,7 +53,7 @@ func (s *Service) JWKS(ctx context.Context) (*JSONWebKeySet, error) {
 
 ```go
 func rotateKey(ctx context.Context, repo rotationRepository, cfg RotationConfig, force bool) (bool, error) {
-	// ...
+	// ... 配置默认值
 	if cfg.RotateBefore <= 0 {
 		cfg.RotateBefore = 24 * time.Hour // 提前 24 小时生成新密钥并发布到 JWKS
 	}
@@ -97,8 +97,7 @@ func rotateKey(ctx context.Context, repo rotationRepository, cfg RotationConfig,
 func (b *KeySyncBroadcaster) Subscribe(ctx context.Context, manager *KeyManager, repo rotationRepository, workingDir string) {
 	go func() {
 		pubsub := b.rdb.Subscribe(ctx, b.channel)
-		defer func() { _ = pubsub.Close() }()
-		// ... 监听逻辑
+		ch := pubsub.Channel()
 		for {
 			select {
 			case _, ok := <-ch:
@@ -108,6 +107,7 @@ func (b *KeySyncBroadcaster) Subscribe(ctx context.Context, manager *KeyManager,
 				if err == nil {
 					manager.ReplaceWith(refreshed)
 				}
+			// ...
 			}
 		}
 	}()
@@ -137,7 +137,7 @@ func (b *KeySyncBroadcaster) Subscribe(ctx context.Context, manager *KeyManager,
 
 ## 3. 失去控制？Refresh Token 是最后的补救
 
-即使 IdP 做了所有正确的事情（JWKS 端点更新及时、Grace Period 设置合理、多实例同步到位），下游服务仍然可能因为自身的原因而同步失败——比如把公钥硬编码在配置文件里（没有动态拉取 JWKS）、或者设置了过长的 JWKS 缓存 TTL。
+即使 IdP 做了所有正确的事情（JWKS 端点更新及时、Grace Period 设置合理、多实例同步到位），下游服务仍然可能因为自身的原因而同步失败——比如把公钥硬编码在配置文件里（没有动态拉取 JWKS）、或者设置了过长的 JWKS缓存 TTL。
 
 在这种情况下，IdP 并非完全无计可施。**短有效期 Access Token + Refresh Token 轮转**构成了第二道防线。
 
@@ -190,17 +190,17 @@ func (b *KeySyncBroadcaster) Subscribe(ctx context.Context, manager *KeyManager,
 func (s *Service) exchangeRefreshToken(ctx context.Context, input ExchangeInput) (*ExchangeResult, error) {
 	// ...
 	if s.tokenCache != nil {
-		// 第一级检查：直接从缓存中获取最近一次成功的轮转结果
+		// 第一级检查：从缓存获取结果，涵盖了网络闪断导致的重复请求
 		replay, _ := s.tokenCache.CheckRefreshTokenReplay(ctx, oldSHA, strings.TrimSpace(input.ReplayFingerprint))
 		if result := refreshReplayToExchangeResult(replay); result != nil {
-			return result, nil // 命中 Grace Replay，直接返回上一次的成功响应
+			return result, nil // 命中 Grace Replay，直接返回上次成功的响应
 		}
 	}
 
-	// ... 数据库操作 ...
+	// ... 数据库原子轮转 ...
 
 	if err := s.tokens.RotateRefreshToken(ctx, oldSHA, now, newRefresh); err != nil {
-		// 第二级检查：如果数据库轮转由于冲突失败，可能是并发重试，再次尝试从缓存恢复
+		// 第二级检查：如果数据库旋转失败（由于并发冲突），再次尝试从缓存恢复结果
 		if replayResult, replayErr := s.tryRefreshTokenGraceReplay(ctx, oldSHA, input.ReplayFingerprint); replayErr == nil && replayResult != nil {
 			return replayResult, nil
 		}
@@ -247,7 +247,30 @@ func (s *Service) exchangeRefreshToken(ctx context.Context, input ExchangeInput)
 2. 吊销该 Family 下所有已签发但尚未过期的 Access Token（如果使用了 Token Introspection 或黑名单机制的话）。
 3. 强制该用户重新认证。
 
-这种"宁可错杀一千"的策略是有道理性：如果一个旧 Token 在宽限期外被重新提交，要么是攻击者拿到了旧 Token，要么是客户端的实现有严重的 bug——无论哪种情况，撤销整个 Family 都是最安全的选择。
+这种"宁可错杀一千"的策略是有道理的：如果一个旧 Token 在宽限期外被重新提交，要么是攻击者拿到了旧 Token，要么是客户端的实现有严重的 bug——无论哪种情况，撤销整个 Family 都是最安全的选择。
+
+本项目在 Redis 缓存层通过 Lua 脚本 (`idp-server/scripts/lua/check_refresh_replay.lua`) 实现了这一安全性响应：
+
+```lua
+-- ... status == "rotated" ...
+if now_ts <= grace_until then
+    -- 在宽限期内，检查指纹
+    if bind_fp == "" or bind_fp == ARGV[2] then
+        local cached = redis.call("GET", KEYS[2]) or ""
+        if cached ~= "" then
+            return { 1, cached } -- 命中 Grace Replay
+        end
+    end
+end
+
+-- 超出宽限期或指纹不匹配：视为泄露/攻击
+local family_ttl = redis.call("TTL", KEYS[1])
+-- 设置一个 Family-wide 的撤销标记，有效期与 Token 剩余 TTL 一致
+redis.call("SET", family_key, "1", "EX", family_ttl)
+-- 将当前 Token 状态标记为已损坏 (compromised)
+redis.call("HSET", KEYS[1], "status", "compromised")
+return { -1, "" } -- 拒绝请求，触发级联撤销
+```
 
 ---
 
@@ -267,21 +290,20 @@ COMMIT;
 
 `revoked = false` 的条件检查和 `UPDATE` 必须在同一个语句中，利用数据库的行级锁防止并发轮转。
 
-本项目在 `idp-server/internal/infrastructure/persistence/token_repo.go` 中的实现逻辑如下：
+本项目在 `idp-server/internal/infrastructure/persistence/token_repo.go` 中通过 `FOR UPDATE` 显式锁保证原子性：
 
 ```go
 func (r *TokenRepository) RotateRefreshToken(ctx context.Context, oldTokenSHA256 string, revokedAt time.Time, newToken *tokendomain.RefreshToken) error {
-	tx, err := r.db.writer().BeginTx(ctx, nil)
-	// ...
-	// 锁住旧 Token 行进行检查
-	oldToken, err := scanRefreshToken(tx.QueryRowContext(ctx, tokenRepositorySQL.rotateFindOldForUpdate, oldTokenSHA256))
+	tx, _ := r.db.writer().BeginTx(ctx, nil)
+	// 使用 FOR UPDATE 锁住旧 Token 行
+	oldToken, _ := scanRefreshToken(tx.QueryRowContext(ctx, sqlRotateFindOldForUpdate, oldTokenSHA256))
 	
-	// 校验旧 Token 是否仍处于活跃状态
+	// 校验状态：必须未撤销且未被替换且未过期
 	if oldToken == nil || oldToken.RevokedAt != nil || oldToken.ReplacedByTokenID != nil || !oldToken.ExpiresAt.After(revokedAt) {
-		return sql.ErrNoRows // 状态非法，拒绝轮转并让上层触发重放/攻击检测
+		return sql.ErrNoRows // 无法轮转，上层将处理为无效或重放
 	}
 
-	// 插入新 Token 并将旧 Token 的 ReplacedByTokenID 指向新 Token ID
+	// 插入新 Token 并关联旧 Token 的 ReplacedByTokenID
 	// ...
 	return tx.Commit()
 }
