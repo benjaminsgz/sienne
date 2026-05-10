@@ -41,15 +41,13 @@ type ManualRotateResult struct {
 func EnsureKeyManager(ctx context.Context, repo rotationRepository, cfg RotationConfig) (*KeyManager, error) {
 	// EnsureKeyManager 先确保“至少有一把可用 active key”，
 	// 再把数据库里的当前密钥集加载进内存 KeyManager。
-	if err := ensureRotation(ctx, repo, cfg); err != nil {
+	if _, err := ensureRotation(ctx, repo, cfg); err != nil {
 		return nil, err
 	}
 	return LoadKeyManagerFromRepository(ctx, repo, cfg.WorkingDir)
 }
 
-func StartRotationLoop(repo rotationRepository, manager *KeyManager, cfg RotationConfig) {
-	// 自动轮换通过后台 ticker 定期检查，
-	// 轮换成功后再把新的 key 集原子刷新到内存 manager。
+func StartRotationLoop(repo rotationRepository, manager *KeyManager, cfg RotationConfig, broadcaster *KeySyncBroadcaster) {
 	if repo == nil || manager == nil || cfg.CheckInterval <= 0 {
 		return
 	}
@@ -60,9 +58,13 @@ func StartRotationLoop(repo rotationRepository, manager *KeyManager, cfg Rotatio
 
 		for range ticker.C {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			if err := ensureRotation(ctx, repo, cfg); err == nil {
+			rotated, err := ensureRotation(ctx, repo, cfg)
+			if err == nil {
 				if refreshed, loadErr := LoadKeyManagerFromRepository(ctx, repo, cfg.WorkingDir); loadErr == nil {
 					manager.ReplaceWith(refreshed)
+					if rotated {
+						_ = broadcaster.Publish(ctx)
+					}
 				}
 			}
 			cancel()
@@ -70,10 +72,9 @@ func StartRotationLoop(repo rotationRepository, manager *KeyManager, cfg Rotatio
 	}()
 }
 
-func ensureRotation(ctx context.Context, repo rotationRepository, cfg RotationConfig) error {
+func ensureRotation(ctx context.Context, repo rotationRepository, cfg RotationConfig) (bool, error) {
 	// 非强制模式下只在即将到达轮换窗口时才生成新 key。
-	_, err := rotateKey(ctx, repo, cfg, false)
-	return err
+	return rotateKey(ctx, repo, cfg, false)
 }
 
 func RotateSigningKeyNow(
@@ -84,9 +85,8 @@ func RotateSigningKeyNow(
 	},
 	manager *KeyManager,
 	cfg RotationConfig,
+	broadcaster *KeySyncBroadcaster,
 ) (*ManualRotateResult, error) {
-	// 手动轮换用于后台管理操作：
-	// 无论当前是否临近轮换窗口，都强制生成并切换新 key。
 	if repo == nil {
 		return nil, fmt.Errorf("rotation repository is required")
 	}
@@ -109,6 +109,7 @@ func RotateSigningKeyNow(
 		}
 		manager.ReplaceWith(refreshed)
 	}
+	_ = broadcaster.Publish(ctx)
 	currentRecords, err := repo.ListCurrent(ctx)
 	if err != nil {
 		return nil, err

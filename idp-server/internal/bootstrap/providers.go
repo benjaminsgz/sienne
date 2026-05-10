@@ -85,6 +85,10 @@ func provideRedis(ctx context.Context, cfg *config) (*goredis.Client, error) {
 	return storage.NewRedis(ctx, cfg.RedisAddr, cfg.RedisPassword, cfg.RedisDB)
 }
 
+func provideKeySyncBroadcaster(rdb *goredis.Client, cfg *config) *infracrypto.KeySyncBroadcaster {
+	return infracrypto.NewKeySyncBroadcaster(rdb, cfg.RedisKeyPrefix)
+}
+
 func provideKeyBuilder(cfg *config) *cacheRedis.KeyBuilder {
 	return cacheRedis.NewKeyBuilder(cfg.RedisKeyPrefix, cfg.AppEnv)
 }
@@ -393,12 +397,14 @@ func provideKeyManager(
 	cfg *config,
 	jwkRepo *persistence.JWKKeyRepository,
 	rotationConfig infracrypto.RotationConfig,
+	broadcaster *infracrypto.KeySyncBroadcaster,
 ) (*infracrypto.KeyManager, error) {
 	keyManager, err := infracrypto.EnsureKeyManager(ctx, jwkRepo, rotationConfig)
 	if err != nil {
 		return infracrypto.NewGeneratedRSAKeyManager(cfg.JWTKeyID, cfg.SigningKeyBits)
 	}
-	infracrypto.StartRotationLoop(jwkRepo, keyManager, rotationConfig)
+	broadcaster.Subscribe(context.Background(), keyManager, jwkRepo, rotationConfig.WorkingDir)
+	infracrypto.StartRotationLoop(jwkRepo, keyManager, rotationConfig, broadcaster)
 	return keyManager, nil
 }
 
@@ -502,9 +508,10 @@ func provideKeysManager(
 	jwkRepo *persistence.JWKKeyRepository,
 	keyManager *infracrypto.KeyManager,
 	rotationConfig infracrypto.RotationConfig,
+	broadcaster *infracrypto.KeySyncBroadcaster,
 ) appkeys.Manager {
 	return appkeys.NewService(func(ctx context.Context) (*appkeys.RotateKeysResult, error) {
-		result, err := infracrypto.RotateSigningKeyNow(ctx, jwkRepo, keyManager, rotationConfig)
+		result, err := infracrypto.RotateSigningKeyNow(ctx, jwkRepo, keyManager, rotationConfig, broadcaster)
 		if err != nil {
 			return nil, err
 		}

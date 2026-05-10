@@ -14,6 +14,7 @@ func initializeApp(ctx context.Context, cfg *config) (*App, error) {
 	wire.Build(
 		provideMySQLDatabases,
 		provideRedis,
+		provideKeySyncBroadcaster,
 		provideKeyBuilder,
 		provideSecretCodec,
 		providePasswordVerifier,

@@ -24,6 +24,7 @@ func initializeApp(ctx context.Context, cfg *config) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
+	keySyncBroadcaster := provideKeySyncBroadcaster(client, cfg)
 	keyBuilder := provideKeyBuilder(cfg)
 	sessionCacheRepository := provideSessionCacheRepository(client, keyBuilder)
 	authorizationCodeRepository := provideAuthorizationCodeRepository(bootstrapMysqlDatabases)
@@ -65,11 +66,11 @@ func initializeApp(ctx context.Context, cfg *config) (*App, error) {
 	rbacManager := provideRBACManager(operatorRoleRepository, userRepository)
 	jwkKeyRepository := provideJWKRepository(bootstrapMysqlDatabases)
 	rotationConfig := provideRotationConfig(cfg)
-	keyManager, err := provideKeyManager(ctx, cfg, jwkKeyRepository, rotationConfig)
+	keyManager, err := provideKeyManager(ctx, cfg, jwkKeyRepository, rotationConfig, keySyncBroadcaster)
 	if err != nil {
 		return nil, err
 	}
-	keysManager := provideKeysManager(jwkKeyRepository, keyManager, rotationConfig)
+	keysManager := provideKeysManager(jwkKeyRepository, keyManager, rotationConfig, keySyncBroadcaster)
 	shortURLRepository := provideShortURLRepository(bootstrapMysqlDatabases)
 	shorturlManager := provideShortURLManager(shortURLRepository)
 	auditEventRepository := provideAuditStore(bootstrapMysqlDatabases)
