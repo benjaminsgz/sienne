@@ -1,6 +1,16 @@
 # Sienne-idp
 
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![Go](https://img.shields.io/badge/Go-1.26.3-00ADD8?logo=go&logoColor=white)](idp-server/go.mod)
+[![Gin](https://img.shields.io/badge/Gin-1.12.0-008ECF?logo=gin&logoColor=white)](https://github.com/gin-gonic/gin)
+[![MySQL](https://img.shields.io/badge/MySQL-8+-4479A1?logo=mysql&logoColor=white)](#项目结构)
+[![Redis](https://img.shields.io/badge/Redis-7+-DC382D?logo=redis&logoColor=white)](#项目结构)
+[![OAuth2](https://img.shields.io/badge/OAuth-2.0-2F2F2F?logo=oauth&logoColor=white)](#核心能力)
+[![OpenID Connect](https://img.shields.io/badge/OpenID-Connect-F78C40?logo=openid&logoColor=white)](#核心能力)
+[![MFA](https://img.shields.io/badge/MFA-TOTP%20%7C%20Passkey-5A2CA0)](#核心能力)
+[![WebAuthn](https://img.shields.io/badge/WebAuthn-Passkey-0A66C2)](#核心能力)
+[![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?logo=docker&logoColor=white)](compose.quickstart.yaml)
+[![Kubernetes](https://img.shields.io/badge/Kubernetes-Ready-326CE5?logo=kubernetes&logoColor=white)](idp-server/deploy)
+[![License](https://img.shields.io/badge/License-Apache%202.0-D22128?logo=apache&logoColor=white)](LICENSE)
 
 语言: [English](README.md) | [简体中文](README.zh-CN.md)
 
