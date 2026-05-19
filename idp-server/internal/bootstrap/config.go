@@ -27,6 +27,8 @@ type config struct {
 	RedisPassword                 string
 	RedisDB                       int
 	RedisKeyPrefix                string
+	RedisSentinelAddrs            string
+	RedisMasterName               string
 	AppEnv                        string
 	AuditAsyncEnabled             bool
 	AuditStream                   string
@@ -95,6 +97,8 @@ var configEnvBindings = []envBinding{
 	{key: "redis.password", envs: []string{"REDIS_PASSWORD", "IDP_REDIS_PASSWORD"}},
 	{key: "redis.db", envs: []string{"REDIS_DB", "IDP_REDIS_DB"}},
 	{key: "redis.key_prefix", envs: []string{"REDIS_KEY_PREFIX", "IDP_REDIS_KEY_PREFIX"}},
+	{key: "redis.sentinel_addrs", envs: []string{"REDIS_SENTINEL_ADDRS", "IDP_REDIS_SENTINEL_ADDRS"}},
+	{key: "redis.master_name", envs: []string{"REDIS_MASTER_NAME", "IDP_REDIS_MASTER_NAME"}},
 	{key: "app.env", envs: []string{"APP_ENV", "IDP_APP_ENV"}},
 	{key: "audit.async_enabled", envs: []string{"AUDIT_ASYNC_ENABLED", "IDP_AUDIT_ASYNC_ENABLED"}},
 	{key: "audit.stream", envs: []string{"AUDIT_STREAM", "IDP_AUDIT_STREAM"}},
@@ -160,6 +164,8 @@ func loadConfig() (*config, error) {
 		RedisPassword:                 v.GetString("redis.password"),
 		RedisDB:                       v.GetInt("redis.db"),
 		RedisKeyPrefix:                strings.TrimSpace(v.GetString("redis.key_prefix")),
+		RedisSentinelAddrs:            strings.TrimSpace(v.GetString("redis.sentinel_addrs")),
+		RedisMasterName:               strings.TrimSpace(v.GetString("redis.master_name")),
 		AppEnv:                        strings.TrimSpace(v.GetString("app.env")),
 		AuditAsyncEnabled:             v.GetBool("audit.async_enabled"),
 		AuditStream:                   strings.TrimSpace(v.GetString("audit.stream")),
@@ -245,6 +251,7 @@ func newConfigViper() *viper.Viper {
 
 	v.SetDefault("redis.db", 0)
 	v.SetDefault("redis.key_prefix", "idp")
+	v.SetDefault("redis.master_name", "idp-master")
 	v.SetDefault("app.env", "dev")
 	v.SetDefault("audit.async_enabled", true)
 	v.SetDefault("audit.consumer_group", "audit-writers")

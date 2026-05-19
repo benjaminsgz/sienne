@@ -82,7 +82,29 @@ func provideMySQLDatabases(ctx context.Context, cfg *config) (*mysqlDatabases, e
 }
 
 func provideRedis(ctx context.Context, cfg *config) (*goredis.Client, error) {
+	if cfg.RedisSentinelAddrs != "" {
+		addrs := splitAndTrim(cfg.RedisSentinelAddrs)
+		if len(addrs) > 0 {
+			masterName := cfg.RedisMasterName
+			if masterName == "" {
+				masterName = "idp-master"
+			}
+			return storage.NewRedisSentinel(ctx, masterName, addrs, cfg.RedisPassword, cfg.RedisDB)
+		}
+	}
 	return storage.NewRedis(ctx, cfg.RedisAddr, cfg.RedisPassword, cfg.RedisDB)
+}
+
+func splitAndTrim(s string) []string {
+	parts := strings.Split(s, ",")
+	var result []string
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			result = append(result, p)
+		}
+	}
+	return result
 }
 
 func provideKeySyncBroadcaster(rdb *goredis.Client, cfg *config) *infracrypto.KeySyncBroadcaster {

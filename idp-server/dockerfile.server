@@ -1,6 +1,8 @@
-FROM golang:1.26 AS builder
+FROM docker.m.daocloud.io/library/golang:1.26 AS builder
 
 WORKDIR /app
+
+ENV GOPROXY=https://goproxy.cn,direct
 
 COPY go.mod go.sum ./
 RUN go mod download
@@ -9,14 +11,12 @@ COPY . .
 
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/idp-server ./cmd/idp
 
-FROM golang:1.26-alpine
-
+FROM docker.m.daocloud.io/library/alpine:3.21
 
 WORKDIR /app
 
-# RUN apt-get update \
-#     && apt-get install -y --no-install-recommends ca-certificates tzdata \
-#     && rm -rf /var/lib/apt/lists/*
+RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.tuna.tsinghua.edu.cn/g' /etc/apk/repositories \
+    && apk add --no-cache ca-certificates tzdata
 
 COPY --from=builder /out/idp-server /app/idp-server
 COPY scripts /app/scripts

@@ -7,6 +7,45 @@ metadata:
     app.kubernetes.io/part-of: idp-stack
 ---
 apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: idp-system-quota
+  namespace: idp-system
+  labels:
+    app.kubernetes.io/part-of: idp-stack
+spec:
+  hard:
+    requests.cpu: "2"
+    requests.memory: 4Gi
+    limits.cpu: "4"
+    limits.memory: 8Gi
+    count/persistentvolumeclaims: "5"
+    requests.storage: 50Gi
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: idp-system-limits
+  namespace: idp-system
+  labels:
+    app.kubernetes.io/part-of: idp-stack
+spec:
+  limits:
+    - type: Container
+      min:
+        cpu: 10m
+        memory: 32Mi
+      max:
+        cpu: "2"
+        memory: 4Gi
+      defaultRequest:
+        cpu: 100m
+        memory: 128Mi
+      default:
+        cpu: 500m
+        memory: 512Mi
+---
+apiVersion: v1
 kind: Secret
 metadata:
   name: idp-runtime-secret
@@ -15,10 +54,11 @@ metadata:
     app.kubernetes.io/part-of: idp-stack
 type: Opaque
 stringData:
-  MYSQL_ROOT_PASSWORD: ChangeThisRootPassword_32CharsMin
-  MYSQL_PASSWORD: ChangeThisAppPassword_32CharsMin
-  REDIS_PASSWORD: ChangeThisRedisPassword_32CharsMin
-  TOTP_SECRET_ENCRYPTION_KEY: ChangeThisTOTPSecretKey32Chars!!
+  MYSQL_ROOT_PASSWORD: <MYSQL_ROOT_PASSWORD>
+  MYSQL_PASSWORD: <MYSQL_PASSWORD>
+  REDIS_PASSWORD: <REDIS_PASSWORD>
+  TOTP_SECRET_ENCRYPTION_KEY: <TOTP_SECRET_ENCRYPTION_KEY>
+  FEDERATED_OIDC_CLIENT_SECRET: <FEDERATED_OIDC_CLIENT_SECRET>
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -38,7 +78,7 @@ data:
   REDIS_KEY_PREFIX: idp
   APP_ENV: prod
   SESSION_TTL: 8h
-  ISSUER: https://idp.example.com
+  ISSUER: https://www.siennesg.online
   LISTEN_ADDR: :8080
   SIGNING_KEY_DIR: /var/lib/idp/signing-keys
   SIGNING_KEY_BITS: "2048"
@@ -50,6 +90,1126 @@ data:
   LOGIN_MAX_FAILURES_PER_USER: "5"
   LOGIN_USER_LOCK_THRESHOLD: "5"
   LOGIN_USER_LOCK_TTL: 30m
+  FEDERATED_OIDC_ISSUER: https://accounts.google.com
+  FEDERATED_OIDC_CLIENT_ID: <FEDERATED_OIDC_CLIENT_ID>
+  FEDERATED_OIDC_REDIRECT_URI: https://www.siennesg.online/login
+  FEDERATED_OIDC_PROVIDER_NAME: Google
+  FEDERATED_OIDC_CLIENT_AUTH_METHOD: client_secret_post
+  FEDERATED_OIDC_USERNAME_CLAIM: email
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: idp-mysql-init
+  namespace: idp-system
+  labels:
+    app.kubernetes.io/part-of: idp-stack
+data:
+  001-migrate.sql: |
+    -- =========================================================
+    -- Go IdP / OAuth2 / OIDC - MySQL 8.0 Migration
+    -- File: migrate.sql
+    -- Charset: utf8mb4
+    -- Engine: InnoDB
+    -- =========================================================
+    
+    SET NAMES utf8mb4;
+    
+    SET FOREIGN_KEY_CHECKS = 0;
+    
+    -- =========================================================
+    -- Drop old tables (reverse dependency order)
+    -- =========================================================
+    DROP TABLE IF EXISTS audit_events;
+    
+    DROP TABLE IF EXISTS short_urls;
+    
+    DROP TABLE IF EXISTS jwk_keys;
+    
+    DROP TABLE IF EXISTS oauth_refresh_tokens;
+    
+    DROP TABLE IF EXISTS oauth_access_tokens;
+    
+    DROP TABLE IF EXISTS oauth_consents;
+    
+    DROP TABLE IF EXISTS oauth_authorization_codes;
+    
+    DROP TABLE IF EXISTS login_sessions;
+    
+    DROP TABLE IF EXISTS user_totp_credentials;
+    DROP TABLE IF EXISTS user_webauthn_credentials;
+    
+    DROP TABLE IF EXISTS operator_roles;
+    
+    DROP TABLE IF EXISTS oauth_client_scopes;
+    
+    DROP TABLE IF EXISTS oauth_client_auth_methods;
+    
+    DROP TABLE IF EXISTS oauth_client_grant_types;
+    
+    DROP TABLE IF EXISTS oauth_client_redirect_uris;
+    
+    DROP TABLE IF EXISTS oauth_client_post_logout_redirect_uris;
+    
+    DROP TABLE IF EXISTS oauth_clients;
+    
+    DROP TABLE IF EXISTS users;
+    
+    SET FOREIGN_KEY_CHECKS = 1;
+    
+    -- =========================================================
+    -- 1. Users
+    -- =========================================================
+    CREATE TABLE users (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT 'internal user id',
+        user_uuid CHAR(36) NOT NULL COMMENT 'external stable user uuid',
+        username VARCHAR(64) NOT NULL,
+        email VARCHAR(255) NOT NULL,
+        email_verified TINYINT(1) NOT NULL DEFAULT 0,
+        display_name VARCHAR(128) NOT NULL,
+        password_hash VARCHAR(255) NOT NULL COMMENT 'bcrypt/argon2 hash',
+        role_code VARCHAR(64) NOT NULL DEFAULT 'end_user' COMMENT 'end_user/support/oauth_admin/security_admin/super_admin',
+        privilege_mask INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '32-bit RBAC privilege mask',
+        tenant_scope VARCHAR(128) NULL COMMENT 'future tenant/org scope boundary',
+        status VARCHAR(32) NOT NULL DEFAULT 'active' COMMENT 'active/locked/disabled',
+        failed_login_count INT NOT NULL DEFAULT 0,
+        last_login_at DATETIME NULL,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        UNIQUE KEY uk_users_user_uuid (user_uuid),
+        UNIQUE KEY uk_users_username (username),
+        UNIQUE KEY uk_users_email (email),
+        KEY idx_users_status (status)
+    ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_0900_ai_ci COMMENT = 'end users';
+    
+    -- =========================================================
+    -- 2. Login sessions
+    -- =========================================================
+    CREATE TABLE login_sessions (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        session_id CHAR(36) NOT NULL COMMENT 'browser/session cookie id',
+        user_id BIGINT UNSIGNED NOT NULL,
+        subject VARCHAR(128) NOT NULL COMMENT 'OIDC subject',
+        acr VARCHAR(128) NULL,
+        amr_json JSON NULL COMMENT '["pwd","otp"]',
+        ip_address VARCHAR(64) NULL,
+        user_agent VARCHAR(512) NULL,
+        authenticated_at DATETIME NOT NULL,
+        expires_at DATETIME NOT NULL,
+        logged_out_at DATETIME NULL,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        UNIQUE KEY uk_login_sessions_session_id (session_id),
+        KEY idx_login_sessions_user_id (user_id),
+        KEY idx_login_sessions_expires_at (expires_at),
+        CONSTRAINT fk_login_sessions_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+    ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_0900_ai_ci COMMENT = 'browser login sessions';
+    
+    -- =========================================================
+    -- 2.1 User TOTP credentials
+    -- =========================================================
+    CREATE TABLE user_totp_credentials (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        user_id BIGINT UNSIGNED NOT NULL,
+        secret VARCHAR(128) NOT NULL COMMENT 'encrypted TOTP secret (enc:v1 payload or legacy plain text)',
+        enabled_at DATETIME NOT NULL,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        UNIQUE KEY uk_user_totp_credentials_user_id (user_id),
+        CONSTRAINT fk_user_totp_credentials_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+    ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_0900_ai_ci COMMENT = 'user totp mfa credentials';
+    
+    -- =========================================================
+    -- 2.1.1 User WebAuthn credentials (passkeys/security keys)
+    -- =========================================================
+    CREATE TABLE user_webauthn_credentials (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        user_id BIGINT UNSIGNED NOT NULL,
+        credential_id VARCHAR(255) NOT NULL COMMENT 'base64url credential id',
+        credential_json JSON NOT NULL COMMENT 'serialized webauthn credential record',
+        last_used_at DATETIME NULL,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        UNIQUE KEY uk_user_webauthn_credentials_credential_id (credential_id),
+        KEY idx_user_webauthn_credentials_user_id (user_id),
+        CONSTRAINT fk_user_webauthn_credentials_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+    ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_0900_ai_ci COMMENT = 'user webauthn passkey credentials';
+    
+    -- =========================================================
+    -- 2.1.2 Short URLs
+    -- =========================================================
+    CREATE TABLE short_urls (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        code VARCHAR(32) NOT NULL,
+        target_url VARCHAR(2048) NOT NULL,
+        click_count BIGINT UNSIGNED NOT NULL DEFAULT 0,
+        expires_at DATETIME NULL,
+        last_access_at DATETIME NULL,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        UNIQUE KEY uk_short_urls_code (code),
+        KEY idx_short_urls_expires_at (expires_at)
+    ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_0900_ai_ci COMMENT = 'short url redirects';
+    
+    -- =========================================================
+    -- 2.2 Operator roles / RBAC presets
+    -- =========================================================
+    CREATE TABLE operator_roles (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        role_code VARCHAR(64) NOT NULL,
+        display_name VARCHAR(128) NOT NULL,
+        description_text VARCHAR(512) NOT NULL,
+        privilege_mask INT UNSIGNED NOT NULL,
+        is_system TINYINT(1) NOT NULL DEFAULT 1,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        UNIQUE KEY uk_operator_roles_role_code (role_code)
+    ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_0900_ai_ci COMMENT = 'rbac role presets for admin/operator users';
+    
+    -- =========================================================
+    -- 3. OAuth clients
+    -- =========================================================
+    CREATE TABLE oauth_clients (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        client_id VARCHAR(128) NOT NULL,
+        client_name VARCHAR(128) NOT NULL,
+        client_secret_hash VARCHAR(255) NULL COMMENT 'public client can be null',
+        client_type VARCHAR(32) NOT NULL DEFAULT 'confidential' COMMENT 'confidential/public',
+        token_endpoint_auth_method VARCHAR(64) NOT NULL DEFAULT 'client_secret_basic',
+        require_pkce TINYINT(1) NOT NULL DEFAULT 1,
+        require_consent TINYINT(1) NOT NULL DEFAULT 1,
+        access_token_ttl_seconds INT NOT NULL DEFAULT 3600,
+        refresh_token_ttl_seconds INT NOT NULL DEFAULT 2592000,
+        id_token_ttl_seconds INT NOT NULL DEFAULT 3600,
+        status VARCHAR(32) NOT NULL DEFAULT 'active',
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        UNIQUE KEY uk_oauth_clients_client_id (client_id),
+        KEY idx_oauth_clients_status (status)
+    ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_0900_ai_ci COMMENT = 'oauth2/oidc clients';
+    
+    -- =========================================================
+    -- 4. Client redirect URIs
+    -- =========================================================
+    CREATE TABLE oauth_client_redirect_uris (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        client_id BIGINT UNSIGNED NOT NULL,
+        redirect_uri VARCHAR(1024) NOT NULL,
+        redirect_uri_sha256 CHAR(64) NOT NULL,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        UNIQUE KEY uk_client_redirect_uri_hash (
+            client_id,
+            redirect_uri_sha256
+        ),
+        CONSTRAINT fk_client_redirect_uris_client FOREIGN KEY (client_id) REFERENCES oauth_clients (id) ON DELETE CASCADE
+    ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_0900_ai_ci;
+    
+    -- =========================================================
+    -- 5. Client grant types
+    -- =========================================================
+    CREATE TABLE oauth_client_post_logout_redirect_uris (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        client_id BIGINT UNSIGNED NOT NULL,
+        redirect_uri VARCHAR(1024) NOT NULL,
+        redirect_uri_sha256 CHAR(64) NOT NULL,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        UNIQUE KEY uk_client_post_logout_redirect_uri_hash (
+            client_id,
+            redirect_uri_sha256
+        ),
+        CONSTRAINT fk_client_post_logout_redirect_uris_client FOREIGN KEY (client_id) REFERENCES oauth_clients (id) ON DELETE CASCADE
+    ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_0900_ai_ci;
+    
+    -- =========================================================
+    -- 5. Client grant types
+    -- =========================================================
+    CREATE TABLE oauth_client_grant_types (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        client_id BIGINT UNSIGNED NOT NULL,
+        grant_type VARCHAR(128) NOT NULL,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        UNIQUE KEY uk_client_grant_type (client_id, grant_type),
+        KEY idx_client_grant_type (grant_type),
+        CONSTRAINT fk_client_grant_types_client FOREIGN KEY (client_id) REFERENCES oauth_clients (id) ON DELETE CASCADE
+    ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_0900_ai_ci COMMENT = 'allowed grant types';
+    
+    -- =========================================================
+    -- 6. Client auth methods
+    -- =========================================================
+    CREATE TABLE oauth_client_auth_methods (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        client_id BIGINT UNSIGNED NOT NULL,
+        auth_method VARCHAR(128) NOT NULL COMMENT 'client_secret_basic/private_key_jwt/etc',
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        UNIQUE KEY uk_client_auth_method (client_id, auth_method),
+        KEY idx_client_auth_method (auth_method),
+        CONSTRAINT fk_client_auth_methods_client FOREIGN KEY (client_id) REFERENCES oauth_clients (id) ON DELETE CASCADE
+    ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_0900_ai_ci COMMENT = 'allowed token endpoint auth methods';
+    
+    -- =========================================================
+    -- 7. Client scopes
+    -- =========================================================
+    CREATE TABLE oauth_client_scopes (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        client_id BIGINT UNSIGNED NOT NULL,
+        scope VARCHAR(128) NOT NULL,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        UNIQUE KEY uk_client_scope (client_id, scope),
+        KEY idx_client_scope (scope),
+        CONSTRAINT fk_client_scopes_client FOREIGN KEY (client_id) REFERENCES oauth_clients (id) ON DELETE CASCADE
+    ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_0900_ai_ci COMMENT = 'allowed scopes for client';
+    
+    -- =========================================================
+    -- 8. Authorization codes
+    -- =========================================================
+    CREATE TABLE oauth_authorization_codes (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        code VARCHAR(128) NOT NULL COMMENT 'raw code or securely generated opaque value',
+        client_id BIGINT UNSIGNED NOT NULL,
+        user_id BIGINT UNSIGNED NOT NULL,
+        session_id BIGINT UNSIGNED NULL,
+        redirect_uri VARCHAR(1024) NOT NULL,
+        scopes_json JSON NOT NULL,
+        state_value VARCHAR(512) NULL,
+        nonce_value VARCHAR(512) NULL,
+        code_challenge VARCHAR(255) NULL,
+        code_challenge_method VARCHAR(16) NULL COMMENT 'plain/S256',
+        expires_at DATETIME NOT NULL,
+        consumed_at DATETIME NULL,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        UNIQUE KEY uk_auth_codes_code (code),
+        KEY idx_auth_codes_client_id (client_id),
+        KEY idx_auth_codes_user_id (user_id),
+        KEY idx_auth_codes_expires_at (expires_at),
+        KEY idx_auth_codes_consumed_at (consumed_at),
+        CONSTRAINT fk_auth_codes_client FOREIGN KEY (client_id) REFERENCES oauth_clients (id) ON DELETE CASCADE,
+        CONSTRAINT fk_auth_codes_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
+        CONSTRAINT fk_auth_codes_session FOREIGN KEY (session_id) REFERENCES login_sessions (id) ON DELETE SET NULL
+    ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_0900_ai_ci COMMENT = 'authorization code with pkce/nonce';
+    
+    -- =========================================================
+    -- 9. User consent
+    -- =========================================================
+    CREATE TABLE oauth_consents (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        user_id BIGINT UNSIGNED NOT NULL,
+        client_id BIGINT UNSIGNED NOT NULL,
+        scopes_json JSON NOT NULL,
+        granted_at DATETIME NOT NULL,
+        revoked_at DATETIME NULL,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        UNIQUE KEY uk_consent_user_client (user_id, client_id),
+        KEY idx_consent_revoked_at (revoked_at),
+        CONSTRAINT fk_consents_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
+        CONSTRAINT fk_consents_client FOREIGN KEY (client_id) REFERENCES oauth_clients (id) ON DELETE CASCADE
+    ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_0900_ai_ci COMMENT = 'remembered user consent';
+    
+    -- =========================================================
+    -- 10. Access tokens
+    -- =========================================================
+    CREATE TABLE oauth_access_tokens (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        token_value VARCHAR(2048) NOT NULL COMMENT 'jwt or opaque token value',
+        token_sha256 CHAR(64) NOT NULL COMMENT 'for secure lookup/revocation',
+        client_id BIGINT UNSIGNED NOT NULL,
+        user_id BIGINT UNSIGNED NULL,
+        subject VARCHAR(128) NOT NULL,
+        audience_json JSON NULL,
+        scopes_json JSON NOT NULL,
+        token_type VARCHAR(32) NOT NULL DEFAULT 'Bearer',
+        token_format VARCHAR(32) NOT NULL DEFAULT 'jwt' COMMENT 'jwt/opaque',
+        issued_at DATETIME NOT NULL,
+        expires_at DATETIME NOT NULL,
+        revoked_at DATETIME NULL,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        UNIQUE KEY uk_access_tokens_sha256 (token_sha256),
+        KEY idx_access_tokens_client_id (client_id),
+        KEY idx_access_tokens_user_id (user_id),
+        KEY idx_access_tokens_subject (subject),
+        KEY idx_access_tokens_expires_at (expires_at),
+        KEY idx_access_tokens_revoked_at (revoked_at),
+        CONSTRAINT fk_access_tokens_client FOREIGN KEY (client_id) REFERENCES oauth_clients (id) ON DELETE CASCADE,
+        CONSTRAINT fk_access_tokens_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE SET NULL
+    ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_0900_ai_ci COMMENT = 'issued access tokens';
+    
+    -- =========================================================
+    -- 11. Refresh tokens
+    -- =========================================================
+    CREATE TABLE oauth_refresh_tokens (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        token_value VARCHAR(1024) NOT NULL COMMENT 'opaque refresh token',
+        token_sha256 CHAR(64) NOT NULL,
+        client_id BIGINT UNSIGNED NOT NULL,
+        user_id BIGINT UNSIGNED NULL,
+        subject VARCHAR(128) NOT NULL,
+        scopes_json JSON NOT NULL,
+        issued_at DATETIME NOT NULL,
+        expires_at DATETIME NOT NULL,
+        revoked_at DATETIME NULL,
+        replaced_by_token_id BIGINT UNSIGNED NULL COMMENT 'rotation chain',
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        UNIQUE KEY uk_refresh_tokens_sha256 (token_sha256),
+        KEY idx_refresh_tokens_client_id (client_id),
+        KEY idx_refresh_tokens_user_id (user_id),
+        KEY idx_refresh_tokens_subject (subject),
+        KEY idx_refresh_tokens_expires_at (expires_at),
+        KEY idx_refresh_tokens_revoked_at (revoked_at),
+        KEY idx_refresh_tokens_replaced_by (replaced_by_token_id),
+        CONSTRAINT fk_refresh_tokens_client FOREIGN KEY (client_id) REFERENCES oauth_clients (id) ON DELETE CASCADE,
+        CONSTRAINT fk_refresh_tokens_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE SET NULL,
+        CONSTRAINT fk_refresh_tokens_replaced_by FOREIGN KEY (replaced_by_token_id) REFERENCES oauth_refresh_tokens (id) ON DELETE SET NULL
+    ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_0900_ai_ci COMMENT = 'issued refresh tokens';
+    
+    -- =========================================================
+    -- 12. JWK signing keys metadata
+    -- =========================================================
+    CREATE TABLE jwk_keys (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        kid VARCHAR(128) NOT NULL,
+        kty VARCHAR(32) NOT NULL,
+        alg VARCHAR(32) NOT NULL,
+        use_type VARCHAR(16) NOT NULL DEFAULT 'sig',
+        public_jwk_json JSON NOT NULL,
+        private_key_ref VARCHAR(255) NULL COMMENT 'vault ref / kms ref / secret path',
+        is_active TINYINT(1) NOT NULL DEFAULT 1,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        rotates_at DATETIME NULL,
+        deactivated_at DATETIME NULL,
+        PRIMARY KEY (id),
+        UNIQUE KEY uk_jwk_keys_kid (kid),
+        KEY idx_jwk_keys_active (is_active),
+        KEY idx_jwk_keys_rotates_at (rotates_at)
+    ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_0900_ai_ci COMMENT = 'signing key metadata';
+    
+    -- =========================================================
+    -- 13. Audit events
+    -- =========================================================
+    CREATE TABLE audit_events (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        event_id VARCHAR(64) NOT NULL,
+        event_type VARCHAR(128) NOT NULL,
+        client_id BIGINT UNSIGNED NULL,
+        user_id BIGINT UNSIGNED NULL,
+        subject VARCHAR(128) NULL,
+        session_id BIGINT UNSIGNED NULL,
+        ip_address VARCHAR(64) NULL,
+        user_agent VARCHAR(512) NULL,
+        metadata_json JSON NULL,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        UNIQUE KEY uk_audit_events_event_id (event_id),
+        KEY idx_audit_events_event_type (event_type),
+        KEY idx_audit_events_client_id (client_id),
+        KEY idx_audit_events_user_id (user_id),
+        KEY idx_audit_events_subject (subject),
+        KEY idx_audit_events_created_at (created_at),
+        CONSTRAINT fk_audit_events_client FOREIGN KEY (client_id) REFERENCES oauth_clients (id) ON DELETE SET NULL,
+        CONSTRAINT fk_audit_events_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE SET NULL,
+        CONSTRAINT fk_audit_events_session FOREIGN KEY (session_id) REFERENCES login_sessions (id) ON DELETE SET NULL
+    ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_0900_ai_ci COMMENT = 'security and business audit log';
+    
+    -- =========================================================
+    -- Seed data
+    -- Password hashes below are placeholders.
+    -- Fixture hashes below are generated through scripts/generate_fixture_hashes.go,
+    -- which uses the app PasswordVerifier implementation.
+    -- Login fixtures:
+    -- alice/alice123 (super_admin)
+    -- bob/bob123 (support)
+    -- charlie/charlie123 (end_user)
+    -- olivia/olivia123 (oauth_admin)
+    -- sam/sam123 (security_admin)
+    -- song/Gaosong8017 (super_admin)
+    -- locked_user/locked123 (locked sample)
+    -- =========================================================
+    
+    -- Users
+    INSERT INTO
+        users (
+            user_uuid,
+            username,
+            email,
+            email_verified,
+            display_name,
+            password_hash,
+            role_code,
+            privilege_mask,
+            tenant_scope,
+            status,
+            failed_login_count,
+            last_login_at
+        )
+    VALUES (
+            '11111111-1111-1111-1111-111111111111',
+            'alice',
+            'alice@example.com',
+            1,
+            'Alice',
+            '<USER_PASSWORD_HASH>',
+            'super_admin',
+            4294967295,
+            NULL,
+            'active',
+            0,
+            NULL
+        ),
+        (
+            '22222222-2222-2222-2222-222222222222',
+            'bob',
+            'bob@example.com',
+            1,
+            'Bob',
+            '<USER_PASSWORD_HASH>',
+            'support',
+            3431757964,
+            NULL,
+            'active',
+            0,
+            NULL
+        ),
+        (
+            '44444444-4444-4444-4444-444444444444',
+            'charlie',
+            'charlie@example.com',
+            1,
+            'Charlie',
+            '<USER_PASSWORD_HASH>',
+            'end_user',
+            0,
+            NULL,
+            'active',
+            0,
+            NULL
+        ),
+        (
+            '55555555-5555-5555-5555-555555555555',
+            'olivia',
+            'olivia@example.com',
+            1,
+            'Olivia',
+            '<USER_PASSWORD_HASH>',
+            'oauth_admin',
+            2397851784,
+            NULL,
+            'active',
+            0,
+            NULL
+        ),
+        (
+            '66666666-6666-6666-6666-666666666666',
+            'sam',
+            'sam@example.com',
+            1,
+            'Sam',
+            '<USER_PASSWORD_HASH>',
+            'security_admin',
+            4008633070,
+            NULL,
+            'active',
+            0,
+            NULL
+        ),
+        (
+            '77777777-7777-7777-7777-777777777777',
+            'song',
+            'song@example.com',
+            1,
+            'Song',
+            '<USER_PASSWORD_HASH>',
+            'super_admin',
+            4294967295,
+            NULL,
+            'active',
+            0,
+            NULL
+        ),
+        (
+            '33333333-3333-3333-3333-333333333333',
+            'locked_user',
+            'locked@example.com',
+            0,
+            'Locked User',
+            '<USER_PASSWORD_HASH>',
+            'end_user',
+            0,
+            NULL,
+            'locked',
+            5,
+            NULL
+        );
+    
+    -- OAuth clients
+    INSERT INTO
+        oauth_clients (
+            client_id,
+            client_name,
+            client_secret_hash,
+            client_type,
+            token_endpoint_auth_method,
+            require_pkce,
+            require_consent,
+            access_token_ttl_seconds,
+            refresh_token_ttl_seconds,
+            id_token_ttl_seconds,
+            status
+        )
+    VALUES (
+            'web-client',
+            'Web Demo Client',
+            '<CLIENT_SECRET_HASH>',
+            'confidential',
+            'client_secret_basic',
+            1,
+            1,
+            3600,
+            2592000,
+            3600,
+            'active'
+        ),
+        (
+            'mobile-public-client',
+            'Mobile Public Client',
+            NULL,
+            'public',
+            'none',
+            1,
+            1,
+            3600,
+            2592000,
+            3600,
+            'active'
+        ),
+        (
+            'service-client',
+            'Backend Service Client',
+            '<CLIENT_SECRET_HASH>',
+            'confidential',
+            'client_secret_basic',
+            0,
+            0,
+            1800,
+            0,
+            0,
+            'active'
+        ),
+        (
+            'legacy-client',
+            'Legacy Password Grant Client',
+            '<CLIENT_SECRET_HASH>',
+            'confidential',
+            'client_secret_basic',
+            0,
+            0,
+            1800,
+            2592000,
+            0,
+            'active'
+        ),
+        (
+            'tv-client',
+            'TV Device Client',
+            '<CLIENT_SECRET_HASH>',
+            'confidential',
+            'client_secret_basic',
+            0,
+            0,
+            1800,
+            2592000,
+            0,
+            'active'
+        );
+    
+    -- Operator roles
+    INSERT INTO
+        operator_roles (
+            role_code,
+            display_name,
+            description_text,
+            privilege_mask,
+            is_system
+        )
+    VALUES
+        (
+            'end_user',
+            'End User',
+            'regular end user without management privilege',
+            0,
+            1
+        ),
+        (
+            'support',
+            'Support Engineer',
+            'support operator with read and limited execution permissions',
+            3431757964,
+            1
+        ),
+        (
+            'oauth_admin',
+            'OAuth Administrator',
+            'operator managing oauth clients and protocol settings',
+            2397851784,
+            1
+        ),
+        (
+            'security_admin',
+            'Security Administrator',
+            'security operator with broad but not catastrophic security permissions',
+            4008633070,
+            1
+        ),
+        (
+            'super_admin',
+            'Super Administrator',
+            'full access operator for bootstrap and emergency operations',
+            4294967295,
+            1
+        );
+    
+    -- Redirect URIs
+    INSERT INTO
+        oauth_client_redirect_uris (
+            client_id,
+            redirect_uri,
+            redirect_uri_sha256
+        )
+    SELECT id, 'http://localhost:3060/callback', SHA2(
+            'http://localhost:3060/callback', 256
+        )
+    FROM oauth_clients
+    WHERE
+        client_id = 'web-client';
+    
+    INSERT INTO
+        oauth_client_redirect_uris (
+            client_id,
+            redirect_uri,
+            redirect_uri_sha256
+        )
+    SELECT id, 'http://localhost:8081/callback', SHA2(
+            'http://localhost:8081/callback', 256
+        )
+    FROM oauth_clients
+    WHERE
+        client_id = 'web-client';
+    
+    INSERT INTO
+        oauth_client_redirect_uris (
+            client_id,
+            redirect_uri,
+            redirect_uri_sha256
+        )
+    SELECT id, 'http://127.0.0.1:3060/callback', SHA2(
+            'http://127.0.0.1:3060/callback', 256
+        )
+    FROM oauth_clients
+    WHERE
+        client_id = 'web-client';
+    
+    INSERT INTO
+        oauth_client_redirect_uris (
+            client_id,
+            redirect_uri,
+            redirect_uri_sha256
+        )
+    SELECT id, 'myapp://callback', SHA2('myapp://callback', 256)
+    FROM oauth_clients
+    WHERE
+        client_id = 'mobile-public-client';
+    
+    -- Post logout redirect URIs
+    INSERT INTO
+        oauth_client_post_logout_redirect_uris (
+            client_id,
+            redirect_uri,
+            redirect_uri_sha256
+        )
+    SELECT id, 'http://localhost:8081/', SHA2('http://localhost:8081/', 256)
+    FROM oauth_clients
+    WHERE
+        client_id = 'web-client';
+    
+    INSERT INTO
+        oauth_client_post_logout_redirect_uris (
+            client_id,
+            redirect_uri,
+            redirect_uri_sha256
+        )
+    SELECT id, 'http://localhost:8081/logout/callback', SHA2(
+            'http://localhost:8081/logout/callback', 256
+        )
+    FROM oauth_clients
+    WHERE
+        client_id = 'web-client';
+    
+    -- Grant types
+    INSERT INTO
+        oauth_client_grant_types (client_id, grant_type)
+    SELECT id, 'authorization_code'
+    FROM oauth_clients
+    WHERE
+        client_id = 'web-client';
+    
+    INSERT INTO
+        oauth_client_grant_types (client_id, grant_type)
+    SELECT id, 'refresh_token'
+    FROM oauth_clients
+    WHERE
+        client_id = 'web-client';
+    
+    INSERT INTO
+        oauth_client_grant_types (client_id, grant_type)
+    SELECT id, 'authorization_code'
+    FROM oauth_clients
+    WHERE
+        client_id = 'mobile-public-client';
+    
+    INSERT INTO
+        oauth_client_grant_types (client_id, grant_type)
+    SELECT id, 'refresh_token'
+    FROM oauth_clients
+    WHERE
+        client_id = 'mobile-public-client';
+    
+    INSERT INTO
+        oauth_client_grant_types (client_id, grant_type)
+    SELECT id, 'client_credentials'
+    FROM oauth_clients
+    WHERE
+        client_id = 'service-client';
+    
+    INSERT INTO
+        oauth_client_grant_types (client_id, grant_type)
+    SELECT id, 'password'
+    FROM oauth_clients
+    WHERE
+        client_id = 'legacy-client';
+    
+    INSERT INTO
+        oauth_client_grant_types (client_id, grant_type)
+    SELECT id, 'refresh_token'
+    FROM oauth_clients
+    WHERE
+        client_id = 'legacy-client';
+    
+    INSERT INTO
+        oauth_client_grant_types (client_id, grant_type)
+    SELECT id, 'urn:ietf:params:oauth:grant-type:device_code'
+    FROM oauth_clients
+    WHERE
+        client_id = 'tv-client';
+    
+    -- Auth methods
+    INSERT INTO
+        oauth_client_auth_methods (client_id, auth_method)
+    SELECT id, 'client_secret_basic'
+    FROM oauth_clients
+    WHERE
+        client_id = 'web-client';
+    
+    INSERT INTO
+        oauth_client_auth_methods (client_id, auth_method)
+    SELECT id, 'none'
+    FROM oauth_clients
+    WHERE
+        client_id = 'mobile-public-client';
+    
+    INSERT INTO
+        oauth_client_auth_methods (client_id, auth_method)
+    SELECT id, 'client_secret_basic'
+    FROM oauth_clients
+    WHERE
+        client_id = 'service-client';
+    
+    INSERT INTO
+        oauth_client_auth_methods (client_id, auth_method)
+    SELECT id, 'client_secret_basic'
+    FROM oauth_clients
+    WHERE
+        client_id = 'legacy-client';
+    
+    INSERT INTO
+        oauth_client_auth_methods (client_id, auth_method)
+    SELECT id, 'client_secret_basic'
+    FROM oauth_clients
+    WHERE
+        client_id = 'tv-client';
+    
+    -- Scopes
+    INSERT INTO
+        oauth_client_scopes (client_id, scope)
+    SELECT id, 'openid'
+    FROM oauth_clients
+    WHERE
+        client_id = 'web-client';
+    
+    INSERT INTO
+        oauth_client_scopes (client_id, scope)
+    SELECT id, 'profile'
+    FROM oauth_clients
+    WHERE
+        client_id = 'web-client';
+    
+    INSERT INTO
+        oauth_client_scopes (client_id, scope)
+    SELECT id, 'email'
+    FROM oauth_clients
+    WHERE
+        client_id = 'web-client';
+    
+    INSERT INTO
+        oauth_client_scopes (client_id, scope)
+    SELECT id, 'offline_access'
+    FROM oauth_clients
+    WHERE
+        client_id = 'web-client';
+    
+    INSERT INTO
+        oauth_client_scopes (client_id, scope)
+    SELECT id, 'openid'
+    FROM oauth_clients
+    WHERE
+        client_id = 'mobile-public-client';
+    
+    INSERT INTO
+        oauth_client_scopes (client_id, scope)
+    SELECT id, 'profile'
+    FROM oauth_clients
+    WHERE
+        client_id = 'mobile-public-client';
+    
+    INSERT INTO
+        oauth_client_scopes (client_id, scope)
+    SELECT id, 'offline_access'
+    FROM oauth_clients
+    WHERE
+        client_id = 'mobile-public-client';
+    
+    INSERT INTO
+        oauth_client_scopes (client_id, scope)
+    SELECT id, 'internal.api.read'
+    FROM oauth_clients
+    WHERE
+        client_id = 'service-client';
+    
+    INSERT INTO
+        oauth_client_scopes (client_id, scope)
+    SELECT id, 'internal.api.write'
+    FROM oauth_clients
+    WHERE
+        client_id = 'service-client';
+    
+    INSERT INTO
+        oauth_client_scopes (client_id, scope)
+    SELECT id, 'openid'
+    FROM oauth_clients
+    WHERE
+        client_id = 'legacy-client';
+    
+    INSERT INTO
+        oauth_client_scopes (client_id, scope)
+    SELECT id, 'profile'
+    FROM oauth_clients
+    WHERE
+        client_id = 'legacy-client';
+    
+    INSERT INTO
+        oauth_client_scopes (client_id, scope)
+    SELECT id, 'offline_access'
+    FROM oauth_clients
+    WHERE
+        client_id = 'legacy-client';
+    
+    INSERT INTO
+        oauth_client_scopes (client_id, scope)
+    SELECT id, 'openid'
+    FROM oauth_clients
+    WHERE
+        client_id = 'tv-client';
+    
+    INSERT INTO
+        oauth_client_scopes (client_id, scope)
+    SELECT id, 'profile'
+    FROM oauth_clients
+    WHERE
+        client_id = 'tv-client';
+    
+    -- Sample consent
+    INSERT INTO
+        oauth_consents (
+            user_id,
+            client_id,
+            scopes_json,
+            granted_at
+        )
+    SELECT u.id, c.id, JSON_ARRAY('openid', 'profile', 'email'), NOW()
+    FROM users u
+        JOIN oauth_clients c ON c.client_id = 'web-client'
+    WHERE
+        u.username = 'alice';
+    
+    -- Signing keys are generated at runtime by the key rotation service.
+    
+    -- Sample login session
+    INSERT INTO
+        login_sessions (
+            session_id,
+            user_id,
+            subject,
+            acr,
+            amr_json,
+            ip_address,
+            user_agent,
+            authenticated_at,
+            expires_at,
+            logged_out_at
+        )
+    SELECT 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', u.id, u.user_uuid, 'urn:idp:acr:pwd', JSON_ARRAY('pwd'), '127.0.0.1', 'seed-script', NOW(), DATE_ADD(NOW(), INTERVAL 8 HOUR), NULL
+    FROM users u
+    WHERE
+        u.username = 'alice';
+    
+    -- Sample authorization code
+    -- PKCE verifier fixture for sample_auth_code_abc123: verifier123
+    INSERT INTO
+        oauth_authorization_codes (
+            code,
+            client_id,
+            user_id,
+            session_id,
+            redirect_uri,
+            scopes_json,
+            state_value,
+            nonce_value,
+            code_challenge,
+            code_challenge_method,
+            expires_at,
+            consumed_at
+        )
+    SELECT 'sample_auth_code_abc123', c.id, u.id, s.id, 'http://localhost:3060/callback', JSON_ARRAY('openid', 'profile', 'email'), 'sample-state-001', 'sample-nonce-001', 'Z_P4EKbGwIkA01e3Y5fp4tMCvn_Ae5nUw7qY7XwkTrQ', 'S256', DATE_ADD(NOW(), INTERVAL 10 MINUTE), NULL
+    FROM
+        oauth_clients c
+        JOIN users u ON u.username = 'alice'
+        JOIN login_sessions s ON s.session_id = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+    WHERE
+        c.client_id = 'web-client';
+    
+    -- Sample access token
+    INSERT INTO
+        oauth_access_tokens (
+            token_value,
+            token_sha256,
+            client_id,
+            user_id,
+            subject,
+            audience_json,
+            scopes_json,
+            token_type,
+            token_format,
+            issued_at,
+            expires_at,
+            revoked_at
+        )
+    SELECT 'sample_access_token_value', SHA2(
+            'sample_access_token_value', 256
+        ), c.id, u.id, u.user_uuid, JSON_ARRAY('web-client'), JSON_ARRAY('openid', 'profile', 'email'), 'Bearer', 'jwt', NOW(), DATE_ADD(NOW(), INTERVAL 1 HOUR), NULL
+    FROM oauth_clients c
+        JOIN users u ON u.username = 'alice'
+    WHERE
+        c.client_id = 'web-client';
+    
+    -- Sample refresh token
+    INSERT INTO
+        oauth_refresh_tokens (
+            token_value,
+            token_sha256,
+            client_id,
+            user_id,
+            subject,
+            scopes_json,
+            issued_at,
+            expires_at,
+            revoked_at,
+            replaced_by_token_id
+        )
+    SELECT 'sample_refresh_token_value', SHA2(
+            'sample_refresh_token_value', 256
+        ), c.id, u.id, u.user_uuid, JSON_ARRAY(
+            'openid', 'profile', 'email', 'offline_access'
+        ), NOW(), DATE_ADD(NOW(), INTERVAL 30 DAY), NULL, NULL
+    FROM oauth_clients c
+        JOIN users u ON u.username = 'alice'
+    WHERE
+        c.client_id = 'web-client';
+    
+    -- Sample audit events
+    INSERT INTO
+        audit_events (
+            event_id,
+            event_type,
+            client_id,
+            user_id,
+            subject,
+            session_id,
+            ip_address,
+            user_agent,
+            metadata_json
+        )
+    SELECT 'seed-audit-login-success-1', 'user.login.success', NULL, u.id, u.user_uuid, s.id, '127.0.0.1', 'seed-script', JSON_OBJECT('method', 'password')
+    FROM users u
+        JOIN login_sessions s ON s.session_id = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+    WHERE
+        u.username = 'alice';
+    
+    INSERT INTO
+        audit_events (
+            event_id,
+            event_type,
+            client_id,
+            user_id,
+            subject,
+            session_id,
+            ip_address,
+            user_agent,
+            metadata_json
+        )
+    SELECT 'seed-audit-oauth-token-issued-1', 'oauth.token.issued', c.id, u.id, u.user_uuid, s.id, '127.0.0.1', 'seed-script', JSON_OBJECT(
+            'grant_type', 'authorization_code', 'scopes', JSON_ARRAY('openid', 'profile', 'email')
+        )
+    FROM
+        oauth_clients c
+        JOIN users u ON u.username = 'alice'
+        JOIN login_sessions s ON s.session_id = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+    WHERE
+        c.client_id = 'web-client';
+    
+    -- =========================================================
+    -- Useful cleanup / maintenance examples
+    -- =========================================================
+    -- DELETE FROM oauth_authorization_codes WHERE expires_at < NOW() OR consumed_at IS NOT NULL;
+    -- DELETE FROM login_sessions WHERE expires_at < NOW() OR logged_out_at IS NOT NULL;
+    -- UPDATE oauth_access_tokens SET revoked_at = NOW() WHERE token_sha256 = SHA2(?, 256);
+    -- UPDATE oauth_refresh_tokens SET revoked_at = NOW() WHERE token_sha256 = SHA2(?, 256);
+    
+    -- =========================================================
+    -- End
+    -- =========================================================
+    
 ---
 apiVersion: v1
 kind: Service
@@ -92,12 +1252,14 @@ spec:
       enableServiceLinks: false
       terminationGracePeriodSeconds: 60
       securityContext:
+        fsGroup: 999
+        fsGroupChangePolicy: OnRootMismatch
         seccompProfile:
           type: RuntimeDefault
       containers:
         - name: mysql
-          image: ghcr.io/your-org/idp-db:2026.04.02
-          imagePullPolicy: IfNotPresent
+          image: idp-db:latest
+          imagePullPolicy: Never
           envFrom:
             - configMapRef:
                 name: idp-runtime-config
@@ -113,6 +1275,14 @@ spec:
             limits:
               cpu: "1"
               memory: 1Gi
+          securityContext:
+            runAsUser: 999
+            runAsGroup: 999
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
           startupProbe:
             exec:
               command:
@@ -143,6 +1313,13 @@ spec:
           volumeMounts:
             - name: mysql-data
               mountPath: /var/lib/mysql
+            - name: mysql-init
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+      volumes:
+        - name: mysql-init
+          configMap:
+            name: idp-mysql-init
   volumeClaimTemplates:
     - metadata:
         name: mysql-data
@@ -196,14 +1373,20 @@ spec:
       enableServiceLinks: false
       terminationGracePeriodSeconds: 30
       securityContext:
-        fsGroup: 1000
+        fsGroup: 999
         fsGroupChangePolicy: OnRootMismatch
         seccompProfile:
           type: RuntimeDefault
       containers:
         - name: redis
-          image: ghcr.io/your-org/idp-redis:2026.04.02
-          imagePullPolicy: IfNotPresent
+          image: idp-redis:latest
+          args:
+            - redis-server
+            - --appendonly
+            - "yes"
+            - --requirepass
+            - "$(REDIS_PASSWORD)"
+          imagePullPolicy: Never
           envFrom:
             - secretRef:
                 name: idp-runtime-secret
@@ -219,7 +1402,7 @@ spec:
               memory: 512Mi
           securityContext:
             runAsUser: 999
-            runAsGroup: 1000
+            runAsGroup: 999
             runAsNonRoot: true
             allowPrivilegeEscalation: false
             capabilities:
@@ -308,9 +1491,12 @@ metadata:
     app.kubernetes.io/part-of: idp-stack
 spec:
   replicas: 1
-  revisionHistoryLimit: 2
+  revisionHistoryLimit: 3
   strategy:
-    type: Recreate
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: idp-server
@@ -328,10 +1514,47 @@ spec:
         fsGroupChangePolicy: OnRootMismatch
         seccompProfile:
           type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: idp-server
+                topologyKey: kubernetes.io/hostname
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: idp-server
+      initContainers:
+        - name: wait-for-deps
+          image: docker.m.daocloud.io/library/busybox:1.36
+          command:
+            - sh
+            - -ec
+            - |
+              echo "Waiting for MySQL (idp-mysql:3306)..."
+              until nc -w 2 idp-mysql 3306 </dev/null 2>/dev/null; do sleep 2; done
+              echo "Waiting for Redis (idp-redis:6379)..."
+              until nc -w 2 idp-redis 6379 </dev/null 2>/dev/null; do sleep 2; done
+              echo "All dependencies ready."
+          securityContext:
+            runAsUser: 65534
+            runAsGroup: 65534
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
       containers:
         - name: server
-          image: ghcr.io/your-org/idp-server:2026.04.02
-          imagePullPolicy: IfNotPresent
+          image: idp-server:latest
+          imagePullPolicy: Never
           envFrom:
             - configMapRef:
                 name: idp-runtime-config
@@ -424,3 +1647,124 @@ spec:
       ports:
         - protocol: TCP
           port: 6379
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: idp-server-ingress
+  namespace: idp-system
+  labels:
+    app.kubernetes.io/name: idp-server
+    app.kubernetes.io/part-of: idp-stack
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: idp-server
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector: {}
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: idp-server-pdb
+  namespace: idp-system
+  labels:
+    app.kubernetes.io/name: idp-server
+    app.kubernetes.io/part-of: idp-stack
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: idp-server
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: idp-server
+  namespace: idp-system
+  labels:
+    app.kubernetes.io/name: idp-server
+    app.kubernetes.io/part-of: idp-stack
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    traefik.ingress.kubernetes.io/router.middlewares: idp-system-idp-redirect-https@kubernetescrd
+spec:
+  rules:
+    - host: www.siennesg.online
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: idp-server
+                port:
+                  number: 8080
+    - host: siennesg.online
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: idp-server
+                port:
+                  number: 8080
+  tls:
+    - hosts:
+        - www.siennesg.online
+        - siennesg.online
+      secretName: idp-tls-cert
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: idp-redirect-https
+  namespace: idp-system
+  labels:
+    app.kubernetes.io/part-of: idp-stack
+spec:
+  redirectScheme:
+    scheme: https
+    permanent: true
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: idp-server-http-redirect
+  namespace: idp-system
+  labels:
+    app.kubernetes.io/name: idp-server
+    app.kubernetes.io/part-of: idp-stack
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+    traefik.ingress.kubernetes.io/router.middlewares: idp-system-idp-redirect-https@kubernetescrd
+spec:
+  rules:
+    - host: www.siennesg.online
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: idp-server
+                port:
+                  number: 8080
+    - host: siennesg.online
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: idp-server
+                port:
+                  number: 8080

@@ -11,3 +11,13 @@ func NewClient(addr, password string, db int) *redis.Client {
 		DB:       db,
 	})
 }
+
+func NewFailoverClient(masterName string, sentinelAddrs []string, password string, db int) *redis.Client {
+	return redis.NewFailoverClient(&redis.FailoverOptions{
+		MasterName:       masterName,
+		SentinelAddrs:    sentinelAddrs,
+		SentinelPassword: password,
+		Password:         password,
+		DB:               db,
+	})
+}
